@@ -1,3 +1,5 @@
+__version__ = "0.2.0"
+
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
