@@ -4,10 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portpeek"
-version = "0.1.0"
-description = "Quickly check if a local TCP port is free or in use"
+version = "0.2.0"
+description = "Fast TCP port and range checker for local and remote hosts"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+license = { text = "GPL-2.0-only" }
+authors = [
+  { name = "Arien" }
+]
 dependencies = []
 
 [project.scripts]
