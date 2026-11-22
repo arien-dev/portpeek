@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portpeek"
+version = "0.1.0"
+description = "Quickly check if a local TCP port is free or in use"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+portpeek = "portpeek.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
