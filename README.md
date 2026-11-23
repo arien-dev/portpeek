@@ -1,3 +1,5 @@
+[![Python Package](https://github.com/arien-dev/portpeek/actions/workflows/python-publish.yml/badge.svg)](https://github.com/arien-dev/portpeek/actions/workflows/python-publish.yml)
+
 # portpeek
 
 **Fast concurrent TCP port checker, free-port finder, live watcher, and interactive CLI inspector.**
