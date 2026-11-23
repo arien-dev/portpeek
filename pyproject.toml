@@ -1,21 +1,78 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "portpeek"
-version = "0.2.0"
-description = "Fast TCP port and range checker for local and remote hosts"
+version = "0.1.0"
+description = "Fast concurrent TCP port checker, free-port finder, live watcher, and interactive CLI inspector."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "GPL-2.0-only" }
+license = { text = "MIT" }
 authors = [
-  { name = "Arien" }
+  { name = "Arien Tschemeris" }
 ]
 dependencies = []
+keywords = ["tcp", "ports", "scanner", "cli", "network", "devops"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
 
 [project.scripts]
 portpeek = "portpeek.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[project.urls]
+Homepage = "https://github.com/arien-dev/portpeek"
+Repository = "https://github.com/arien-dev/portpeek"
+Issues = "https://github.com/arien-dev/portpeek/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/portpeek"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "portpeek"
+version = "1.2.0"
+description = "Fast concurrent TCP port checker, free-port finder, live watcher, and interactive CLI inspector."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Arien Tschemeris" }
+]
+dependencies = []
+keywords = ["tcp", "ports", "scanner", "cli", "network", "devops"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.scripts]
+portpeek = "portpeek.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/arien-dev/portpeek"
+Repository = "https://github.com/arien-dev/portpeek"
+Issues = "https://github.com/arien-dev/portpeek/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/portpeek"]
