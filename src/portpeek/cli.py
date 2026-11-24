@@ -1,459 +1,550 @@
+"""portpeek CLI entrypoint — ultra-fast port, process, TLS & network inspector."""
+
+from __future__ import annotations
+
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import csv
 import json
-import os
-import socket
 import sys
-import termios
-import time
-import tty
-from typing import Any
+import webbrowser
+from typing import Any, Sequence
 
-ASCII_BANNER = r"""
- ____   ___  ____ _____ ____  _____ _____ _  __
-|  _ \ / _ \|  _ \_   _|  _ \| ____| ____| |/ /
-| |_) | | | | |_) || | | |_) |  _| |  _| | ' / 
-|  __/| |_| |  _ < | | |  __/| |___| |___| . \ 
-|_|    \___/|_| \_\|_| |_|   |_____|_____|_|\_\
-"""
+from . import __version__
+from .constants import (
+    ANSI_BOLD,
+    ANSI_CYAN,
+    ANSI_DIM,
+    ANSI_GREEN,
+    ANSI_RESET,
+    ANSI_YELLOW,
+    ASCII_BANNER,
+    AUTHOR_LINE_HELP,
+    DEFAULT_FREEPORT_RANGE,
+    GITHUB_URL,
+    PRESETS,
+)
+from .core import (
+    copy_to_clipboard,
+    export_results,
+    find_free_block,
+    find_free_port_local,
+    normalize_output_path,
+    parse_freeport_spec,
+    parse_ports,
+    print_results,
+    print_summary,
+    resolve_hosts_and_ports,
+    scan_hosts,
+    use_color,
+    watch_loop,
+)
+from .doctor import (
+    diagnose,
+    diff_hosts,
+    format_diff,
+    format_doctor,
+    parse_endpoint,
+    tcp_ping,
+)
+from .local import (
+    enrich_scan_with_proc,
+    format_list_table,
+    format_who,
+    kill_pid,
+    list_listening,
+    who_port,
+)
+from .menu import run_menu
 
-ANSI_RESET = "\033[0m"
-ANSI_GREEN = "\033[32m"
-ANSI_RED = "\033[31m"
-ANSI_DIM = "\033[2m"
-
-
-def parse_ports(raw_items: list[str]) -> list[int]:
-    """Parse single ports, comma lists, and 'start-end' ranges into deduplicated ints."""
-    ports: list[int] = []
-    seen: set[int] = set()
-
-    tokens: list[str] = []
-    for raw in raw_items:
-        for part in raw.split(","):
-            token = part.strip()
-            if token:
-                tokens.append(token)
-
-    for item in tokens:
-        if "-" in item:
-            parts = item.split("-", 1)
-            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-                raise ValueError(f"Invalid port range: '{item}'")
-            start, end = int(parts[0]), int(parts[1])
-            if start > end or not (1 <= start <= 65535) or not (1 <= end <= 65535):
-                raise ValueError(f"Port range out of bounds (1-65535): '{item}'")
-            for p in range(start, end + 1):
-                if p not in seen:
-                    seen.add(p)
-                    ports.append(p)
-        else:
-            if not item.isdigit():
-                raise ValueError(f"Invalid port number: '{item}'")
-            p = int(item)
-            if not (1 <= p <= 65535):
-                raise ValueError(f"Port must be between 1 and 65535: {p}")
-            if p not in seen:
-                seen.add(p)
-                ports.append(p)
-
-    return ports
-
-
-def service_name(port: int) -> str:
-    """Return standard IANA service name for a TCP port if known."""
-    try:
-        return socket.getservbyport(port, "tcp")
-    except OSError:
-        return "-"
-
-
-def _grab_banner(sock: socket.socket, port: int) -> str | None:
-    """Best-effort lightweight banner grab without hanging."""
-    try:
-        sock.settimeout(0.35)
-        if port in (80, 8080, 8000, 3000, 5173):
-            sock.sendall(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n")
-        data = sock.recv(128)
-        if not data:
-            return None
-        cleaned = data.decode("utf-8", errors="replace").replace("\r", " ").replace("\n", " ").strip()
-        return cleaned[:80] if cleaned else None
-    except OSError:
-        return None
-
-
-def check_port(
-    host: str,
-    port: int,
-    timeout: float = 0.25,
-    measure_latency: bool = False,
-    grab_banner: bool = False,
-) -> dict[str, Any]:
-    """Check a single TCP port using getaddrinfo (IPv4/IPv6) and return a result dict."""
-    start_time = time.perf_counter()
-    is_open = False
-    banner: str | None = None
-
-    try:
-        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        for family, socktype, proto, _, sockaddr in addr_info:
-            with socket.socket(family, socktype, proto) as sock:
-                sock.settimeout(timeout)
-                if sock.connect_ex(sockaddr) == 0:
-                    is_open = True
-                    if grab_banner:
-                        banner = _grab_banner(sock, port)
-                    break
-    except OSError:
-        is_open = False
-
-    elapsed_ms = round((time.perf_counter() - start_time) * 1000, 1)
-
-    result: dict[str, Any] = {
-        "host": host,
-        "port": port,
-        "status": "open" if is_open else "free",
-        "service": service_name(port),
+SUBCOMMANDS = frozenset(
+    {
+        "menu",
+        "freeport",
+        "who",
+        "pid",
+        "list",
+        "ls",
+        "doctor",
+        "check",
+        "diff",
+        "ping",
+        "repo",
+        "github",
+        "help",
     }
-    if measure_latency:
-        result["latency_ms"] = elapsed_ms
-    if grab_banner and is_open:
-        result["banner"] = banner or "-"
-    return result
+)
 
 
-def scan_target(
-    host: str,
-    ports: list[int],
-    timeout: float = 0.25,
-    workers: int = 64,
-    measure_latency: bool = False,
-    grab_banner: bool = False,
-) -> list[dict[str, Any]]:
-    """Scan all given ports on a single host while preserving port order."""
-    if not ports:
-        return []
-
-    results_by_port: dict[int, dict[str, Any]] = {}
-    max_workers = max(1, min(workers, len(ports)))
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(check_port, host, port, timeout, measure_latency, grab_banner): port
-            for port in ports
-        }
-        for future in as_completed(futures):
-            res = future.result()
-            results_by_port[res["port"]] = res
-
-    return [results_by_port[p] for p in ports]
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
 
 
-def scan_hosts(
-    hosts: list[str],
-    ports: list[int],
-    timeout: float = 0.25,
-    workers: int = 64,
-    measure_latency: bool = False,
-    grab_banner: bool = False,
-) -> list[dict[str, Any]]:
-    """Scan ports across one or more hosts."""
-    all_results: list[dict[str, Any]] = []
-    for host in hosts:
-        all_results.extend(
-            scan_target(
-                host=host,
-                ports=ports,
-                timeout=timeout,
-                workers=workers,
-                measure_latency=measure_latency,
-                grab_banner=grab_banner,
-            )
-        )
-    return all_results
+def _c(text: str, *codes: str, on: bool) -> str:
+    if not on or not codes:
+        return text
+    return f"{''.join(codes)}{text}{ANSI_RESET}"
 
 
-def find_free_block(ports: list[int], results: list[dict[str, Any]], block_size: int) -> list[int] | None:
-    """Find a contiguous sequence of `block_size` free ports in `ports` order."""
-    status_map = {r["port"]: r["status"] for r in results}
-    run: list[int] = []
-    for p in ports:
-        if status_map.get(p) == "free":
-            run.append(p)
-            if len(run) == block_size:
-                return run
-        else:
-            run = []
-    return None
+def format_help_text(*, color: bool | None = None) -> str:
+    """Build the main help screen; light accent colors when stdout is a TTY."""
+    on = use_color(False) if color is None else color
 
+    def banner() -> str:
+        lines = ASCII_BANNER.strip("\n").splitlines()
+        return "\n".join(_c(line, ANSI_BOLD, ANSI_CYAN, on=on) for line in lines)
 
-def export_results(path: str, rows: list[dict[str, Any]]) -> None:
-    """Export scan rows to .json or .csv based on file extension."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".csv":
-        fieldnames = ["host", "port", "status", "service", "latency_ms", "banner"]
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-    else:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(rows, f, indent=2)
+    def head(title: str) -> str:
+        return _c(title, ANSI_BOLD, ANSI_CYAN, on=on)
 
+    def cmd(name: str, width: int = 26) -> str:
+        return _c(name.ljust(width), ANSI_BOLD, ANSI_GREEN, on=on)
 
-def _use_color(no_color: bool) -> bool:
-    return not no_color and sys.stdout.isatty()
+    def flag(name: str, width: int = 26) -> str:
+        return _c(name.ljust(width), ANSI_YELLOW, on=on)
 
+    def dim(text: str) -> str:
+        return _c(text, ANSI_DIM, on=on)
 
-def print_results(
-    results: list[dict[str, Any]],
-    show_services: bool = False,
-    no_color: bool = False,
-) -> None:
-    color = _use_color(no_color)
-    for r in results:
-        is_open = r["status"] == "open"
-        if is_open:
-            tag = f"{ANSI_RED}[IN USE]{ANSI_RESET}" if color else "[IN USE]"
-        else:
-            tag = f"{ANSI_GREEN}[FREE]  {ANSI_RESET}" if color else "[FREE]  "
+    def comment(text: str) -> str:
+        return _c(text, ANSI_DIM, on=on)
 
-        svc = f" ({r['service']})" if show_services else ""
-        lat = f" [{r['latency_ms']} ms]" if "latency_ms" in r else ""
-        banner = f" {ANSI_DIM}| {r['banner']}{ANSI_RESET}" if r.get("banner") and r["banner"] != "-" else ""
-        print(f"{tag} {r['host']}:{r['port']}{svc}{lat}{banner}")
-
-
-def watch_loop(
-    hosts: list[str],
-    ports: list[int],
-    interval: float,
-    timeout: float,
-    workers: int,
-    show_services: bool,
-    measure_latency: bool,
-    no_color: bool,
-) -> None:
-    """Continuously monitor ports and highlight state transitions."""
-    prev_states: dict[tuple[str, int], str] = {}
-    try:
-        while True:
-            results = scan_hosts(
-                hosts=hosts,
-                ports=ports,
-                timeout=timeout,
-                workers=workers,
-                measure_latency=measure_latency,
-                grab_banner=False,
-            )
-            os.system("clear")
-            ts = time.strftime("%H:%M:%S")
-            print(f"portpeek watch @ {ts} (every {interval}s) — Ctrl+C to stop\n")
-            for r in results:
-                key = (r["host"], r["port"])
-                curr = r["status"]
-                prev = prev_states.get(key)
-                change = ""
-                if prev is not None and prev != curr:
-                    change = f"  <-- CHANGED ({prev} -> {curr})"
-                prev_states[key] = curr
-
-                tag = "[IN USE]" if curr == "open" else "[FREE]  "
-                svc = f" ({r['service']})" if show_services else ""
-                lat = f" [{r['latency_ms']} ms]" if "latency_ms" in r else ""
-                print(f"{tag} {r['host']}:{r['port']}{svc}{lat}{change}")
-            time.sleep(max(0.2, interval))
-    except KeyboardInterrupt:
-        print("\nWatch stopped.")
-
-
-def _read_key() -> str:
-    """Read a single keypress or escape sequence (up/down arrows)."""
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            seq = sys.stdin.read(2)
-            if seq == "[A":
-                return "UP"
-            if seq == "[B":
-                return "DOWN"
-            return "ESC"
-        if ch in ("\r", "\n"):
-            return "ENTER"
-        if ch in ("k", "K"):
-            return "UP"
-        if ch in ("j", "J"):
-            return "DOWN"
-        if ch in ("q", "Q", "\x03"):
-            return "QUIT"
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-
-def select_option(title: str, subtitle: str, options: list[tuple[str, str]]) -> int | None:
-    """Render ASCII header + interactive up/down selector. Returns selected index or None."""
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print(ASCII_BANNER)
-        print(f"{title} — {subtitle}")
-        for idx, (label, desc) in enumerate(options, start=1):
-            print(f"  [{idx}] {label} ({desc})")
-        choice = input("Select number (or q): ").strip().lower()
-        if choice == "q" or not choice.isdigit():
-            return None
-        num = int(choice) - 1
-        return num if 0 <= num < len(options) else None
-
-    selected = 0
-    while True:
-        os.system("clear")
-        print(ASCII_BANNER.strip("\n"))
-        print(f"  {title}")
-        print(f"  {subtitle}")
-        print("  Use [↑/↓] or [j/k] to move, [Enter] to select, [q] to quit\n")
-
-        for idx, (label, desc) in enumerate(options):
-            cursor = "›" if idx == selected else " "
-            line = f"  {cursor} {label:<28} {desc}"
-            if idx == selected:
-                print(f"\033[7m{line}\033[0m")
-            else:
-                print(line)
-
-        key = _read_key()
-        if key == "UP":
-            selected = (selected - 1) % len(options)
-        elif key == "DOWN":
-            selected = (selected + 1) % len(options)
-        elif key == "ENTER":
-            return selected
-        elif key in ("QUIT", "ESC"):
-            return None
-
-
-def run_menu() -> None:
-    presets = [
-        ("Common Web & Dev Ports", "80, 443, 3000, 5173, 8000, 8080", "127.0.0.1", "80,443,3000,5173,8000,8080"),
-        ("Databases & Cache", "5432, 3306, 6379, 27017", "127.0.0.1", "5432,3306,6379,27017"),
-        ("Find First Free Dev Port", "3000-3050", "127.0.0.1", "3000-3050"),
-        ("Find Contiguous Free Block", "3 ports in 4000-4100", "127.0.0.1", "4000-4100"),
-        ("Watch Ports Live", "Live status transitions", "127.0.0.1", "3000,8080"),
-        ("Custom Host & Ports", "Interactive prompt", "", ""),
+    subcommands = [
+        ("freeport [RANGE|COUNT]", "Next free port (default 3000-3999); ideal for PORT=$(…)"),
+        ("who|pid <PORT>", "Which process owns a local port (optional --kill)"),
+        ("list|ls", "Table of local listening TCP/UDP ports"),
+        ("doctor|check <HOST:PORT>", "DNS + TCP latency + TLS cert + HTTP headers"),
+        ("diff <A> <B> [PORTS]", "Compare open/free ports across two hosts"),
+        ("ping <HOST:PORT>", "Continuous TCP latency (ICMP-free)"),
+        ("menu", "Interactive ASCII menu (↑/↓ · j/k · g=GitHub)"),
+        ("repo|github", "Open GitHub repo in your browser"),
     ]
 
-    while True:
-        menu_items = [(p[0], p[1]) for p in presets] + [("Exit", "Quit portpeek menu")]
-        idx = select_option("PORTPEEK INTERACTIVE MENU", "Quick TCP Port Inspector", menu_items)
-        if idx is None or idx == len(presets):
-            os.system("clear")
-            return
+    target_opts = [
+        ("ports", "Port numbers, lists, ranges  (80 443 3000-3010)"),
+        ("HOST:PORT", "Direct target as positional  (127.0.0.1:3000)"),
+        ("--host HOST [HOST…]", "One or more hosts            (default: 127.0.0.1)"),
+        ("--host-file FILE", "Hosts file (one per line)"),
+        ("--cidr CIDR", "Expand subnet (max 4096 hosts)"),
+        ("--preset NAME", "common | web | db | dev"),
+    ]
+    inspect_opts = [
+        ("--services", "Show IANA TCP service names"),
+        ("--latency", "Measure connect time (ms)"),
+        ("--banner", "Grab short banner from open ports"),
+        ("--proc", "Attach local PID / process / Docker info"),
+        ("--timeout SEC", "Per-port connect timeout     (default: 0.25)"),
+        ("--workers N", "Concurrent worker threads    (default: 64)"),
+        ("--summary", "Print open/free totals"),
+        ("--tls", "Force TLS checks (doctor)"),
+    ]
+    free_opts = [
+        ("--find-free", "Print first free port and exit"),
+        ("--block N", "Find N contiguous free ports"),
+        ("--watch [SEC]", "Live status monitor          (default interval: 1.5)"),
+    ]
+    filter_opts = [
+        ("--only-open / --only-free", ""),
+        ("--max-latency MS", "Keep results at or below latency"),
+        ("--dev-only / --public / --search NAME", "(list)"),
+        ("-o, --output [PATH|EXT]", "Export .json .jsonl .csv .md .txt"),
+        ("--include-meta", "Add timestamp / tool meta to export"),
+        ("--json", "Print JSON to stdout"),
+        ("--quiet", "Exit status only"),
+        ("--no-color", "Disable ANSI colors"),
+        ("-V, --version", "Show version and exit"),
+    ]
 
-        title, _, default_host, default_ports = presets[idx]
-        os.system("clear")
-        print(f"=== {title} ===\n")
+    examples = [
+        ("# Is my dev server port free?", ["portpeek 3000"]),
+        ("# Classic multi-port scan with service names", ["portpeek 80 443 --services"]),
+        ("# HOST:PORT shorthand", ["portpeek example.com:443 --latency --banner"]),
+        (
+            "# Shell-friendly free port",
+            ["PORT=$(portpeek freeport)", "PORT=$(portpeek freeport 4000-4100 --block 3 --copy)"],
+        ),
+        ("# Who is blocking me?", ["portpeek who 5432", "portpeek who 3000 --kill --yes"]),
+        (
+            "# What's listening locally (and dangerously public)?",
+            ["portpeek list --public", "portpeek ls --dev-only --search node"],
+        ),
+        (
+            "# One-shot deep diagnose instead of curl/openssl/wireshark",
+            ["portpeek doctor example.com:443", "portpeek check 127.0.0.1:8080"],
+        ),
+        ("# Staging vs local", ["portpeek diff localhost staging.example.com web"]),
+        ("# TCP ping when ICMP is blocked", ["portpeek ping db.internal:5432 -c 5"]),
+        (
+            "# Presets, watch, export",
+            [
+                "portpeek --preset db --proc --summary",
+                "portpeek 3000,8080 --watch 1",
+                "portpeek --preset web -o report.md --include-meta",
+            ],
+        ),
+        ("# Interactive menu", ["portpeek menu"]),
+    ]
 
-        if idx == 5:
-            host = input("Host [127.0.0.1]: ").strip() or "127.0.0.1"
-            raw_ports = input("Ports/Ranges (e.g. 80,443,8000-8010): ").strip()
-            if not raw_ports:
-                print("No ports entered.")
-                input("\nPress Enter to continue...")
-                continue
+    lines: list[str] = [
+        banner(),
+        f"  {_c('Fast port · process · TLS · network inspector for developers', ANSI_DIM, on=on)}",
+        f"  {_c(AUTHOR_LINE_HELP, ANSI_DIM, on=on)}",
+        f"  {_c(f'version {__version__}', ANSI_DIM, on=on)}",
+        "",
+        head("USAGE"),
+        f"  {_c('portpeek', ANSI_GREEN, on=on)} <ports…> [options]",
+        f"  {_c('portpeek', ANSI_GREEN, on=on)} <HOST:PORT> [options]",
+        f"  {_c('portpeek', ANSI_GREEN, on=on)} <subcommand> [args] [options]",
+        "",
+        head("QUICK SUBCOMMANDS"),
+    ]
+    for name, desc in subcommands:
+        lines.append(f"  {cmd(name)}{dim(desc)}")
+
+    lines += ["", head("TARGETS & PRESETS")]
+    for name, desc in target_opts:
+        lines.append(f"  {flag(name)}{dim(desc)}" if desc else f"  {flag(name).rstrip()}")
+
+    lines += ["", head("INSPECTION & DIAGNOSTICS")]
+    for name, desc in inspect_opts:
+        lines.append(f"  {flag(name)}{dim(desc)}")
+
+    lines += ["", head("FREE PORT & WATCH")]
+    for name, desc in free_opts:
+        lines.append(f"  {flag(name)}{dim(desc)}")
+
+    lines += ["", head("FILTERING & EXPORT")]
+    for name, desc in filter_opts:
+        if desc:
+            lines.append(f"  {flag(name, 40)}{dim(desc)}")
         else:
-            host = input(f"Host [{default_host}]: ").strip() or default_host
-            raw_ports = input(f"Ports [{default_ports}]: ").strip() or default_ports
+            lines.append(f"  {flag(name, 40).rstrip()}")
 
-        try:
-            ports = parse_ports([raw_ports])
-        except ValueError as exc:
-            print(f"\nError: {exc}")
-            input("\nPress Enter to continue...")
-            continue
+    lines += ["", head("EXAMPLES")]
+    for note, cmds in examples:
+        lines.append(f"  {comment(note)}")
+        for c_line in cmds:
+            # Highlight leading portpeek / PORT=$(portpeek …) lightly
+            if c_line.startswith("PORT=$("):
+                lines.append(f"  {c_line}")
+            elif c_line.startswith("portpeek "):
+                rest = c_line[len("portpeek") :]
+                lines.append(f"  {_c('portpeek', ANSI_GREEN, on=on)}{rest}")
+            else:
+                lines.append(f"  {c_line}")
+        lines.append("")
 
-        if idx == 2:
-            results = scan_target(host, ports)
-            free_port = next((r["port"] for r in results if r["status"] == "free"), None)
-            print(f"\nFirst free port on {host}: {free_port}" if free_port else "\nNo free port found.")
-        elif idx == 3:
-            raw_size = input("Block size [3]: ").strip() or "3"
-            size = int(raw_size) if raw_size.isdigit() and int(raw_size) > 0 else 3
-            results = scan_target(host, ports)
-            block = find_free_block(ports, results, size)
-            print(f"\nFree block ({size} ports): {block}" if block else f"\nNo {size}-port free block found.")
-        elif idx == 4:
-            raw_int = input("Interval in seconds [1.5]: ").strip() or "1.5"
-            try:
-                interval = float(raw_int)
-            except ValueError:
-                interval = 1.5
-            watch_loop([host], ports, interval, 0.25, 64, True, True, False)
-        else:
-            print(f"\nScanning {host} ({len(ports)} port(s))...\n")
-            results = scan_target(host, ports, measure_latency=True, grab_banner=True)
-            print_results(results, show_services=True)
+    lines.append(
+        dim("Run `portpeek <subcommand> --help` for subcommand-specific options.")
+    )
+    return "\n".join(lines)
 
-        input("\nPress Enter to return to menu...")
+
+# Back-compat alias for anything importing HELP_TEXT
+HELP_TEXT = format_help_text(color=False)
+
+
+class _HelpAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):  # noqa: ANN001
+        print(format_help_text())
+        parser.exit(0)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="portpeek",
-        description="Fast TCP port & range checker for local and remote hosts.",
+        description="Fast port · process · TLS · network inspector for developers.",
+        add_help=False,
     )
-    subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("menu", help="Launch interactive ASCII menu with arrow-key navigation")
+    parser.add_argument("-h", "--help", action=_HelpAction, nargs=0, help=argparse.SUPPRESS)
+    parser.add_argument("-V", "--version", action="version", version=f"portpeek {__version__}")
 
-    scan_parser = argparse.ArgumentParser(add_help=False)
-    scan_parser.add_argument("ports", nargs="+", help="Port numbers or ranges (e.g. 80 443 3000-3010)")
-    scan_parser.add_argument("--host", nargs="+", default=["127.0.0.1"], help="One or more target hosts")
-    scan_parser.add_argument("--timeout", type=float, default=0.25, help="Connection timeout per port in seconds")
-    scan_parser.add_argument("--workers", type=int, default=64, help="Number of concurrent worker threads")
-    scan_parser.add_argument("--services", action="store_true", help="Show known TCP service names")
-    scan_parser.add_argument("--latency", action="store_true", help="Measure connection time in ms")
-    scan_parser.add_argument("--banner", action="store_true", help="Grab short response banner from open ports")
-    scan_parser.add_argument("--find-free", action="store_true", help="Print first free port and exit")
-    scan_parser.add_argument("--block", type=int, default=0, help="Find N contiguous free ports and exit")
-    scan_parser.add_argument("--watch", nargs="?", const=1.5, type=float, metavar="SEC", help="Watch ports continuously")
-    scan_parser.add_argument("-o", "--output", help="Export results to .json or .csv file")
-    scan_parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
-    scan_parser.add_argument("--json", action="store_true", help="Output results as JSON")
-    scan_parser.add_argument("--quiet", action="store_true", help="Suppress output and return exit status only")
+    # Shared scan / global options (also work with bare port syntax)
+    parser.add_argument("targets", nargs="*", help=argparse.SUPPRESS)
+    parser.add_argument("--host", nargs="+", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--host-file", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--cidr", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--preset", choices=sorted(PRESETS.keys()), default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--timeout", type=float, default=0.25, help=argparse.SUPPRESS)
+    parser.add_argument("--workers", type=int, default=64, help=argparse.SUPPRESS)
+    parser.add_argument("--services", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--latency", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--banner", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--proc", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--find-free", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--block", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--watch", nargs="?", const=1.5, type=float, metavar="SEC", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-o",
+        "--output",
+        nargs="?",
+        const="",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--include-meta", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-color", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--summary", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--max-latency", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--tls", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--copy", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--kill", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--yes", "-y", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--dev-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--public", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--search", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("-c", "--count", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--interval", type=float, default=1.0, help=argparse.SUPPRESS)
 
-    filter_group = scan_parser.add_mutually_exclusive_group()
-    filter_group.add_argument("--only-open", action="store_true", help="Only include open (in-use) ports")
-    filter_group.add_argument("--only-free", action="store_true", help="Only include free ports")
-
-    for action in scan_parser._actions:
-        if action.dest != "help":
-            parser._add_action(action)
+    filter_group = parser.add_mutually_exclusive_group()
+    filter_group.add_argument("--only-open", action="store_true", help=argparse.SUPPRESS)
+    filter_group.add_argument("--only-free", action="store_true", help=argparse.SUPPRESS)
 
     return parser
 
 
-def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "menu":
-        run_menu()
-        sys.exit(0)
+def _subcommand_help(name: str) -> str:
+    helps = {
+        "freeport": """usage: portpeek freeport [RANGE|COUNT] [--block N] [--copy] [--json] [--quiet]
 
-    parser = build_parser()
-    args = parser.parse_args()
+Find the next free TCP port (default range 3000-3999).
+Prints only the port number — perfect for PORT=$(portpeek freeport).
 
+  --block N    Require N contiguous free ports (prints space-separated list)
+  --copy       Copy result to clipboard (wl-copy / xclip / pbcopy / clip)
+""",
+        "who": """usage: portpeek who|pid <PORT> [--kill [--yes] [--force]] [--json]
+
+Show which local process owns PORT (PID, user, cmdline, bind, uptime, Docker).
+
+  --kill       Send SIGTERM (or SIGKILL with --force); requires --yes or prompt
+  --yes / -y   Skip confirmation
+  --force      Use SIGKILL instead of SIGTERM
+""",
+        "list": """usage: portpeek list|ls [--dev-only] [--public] [--search NAME] [--json] [-o FILE]
+
+List local listening TCP & UDP ports as a table.
+
+  --dev-only   Ports >= 1024 only
+  --public     Only 0.0.0.0 / :: bindings (network-reachable!)
+  --search S   Filter by process / command / user substring
+""",
+        "doctor": """usage: portpeek doctor|check <HOST:PORT|HOST PORT> [--tls] [--timeout SEC] [--json]
+
+Deep one-shot diagnose: DNS, TCP latency (3 probes), TLS cert, HTTP headers,
+plus a plain-English diagnosis line.
+""",
+        "diff": """usage: portpeek diff <HOST_A> <HOST_B> [PORTS|PRESET]
+
+Compare two hosts side-by-side: ONLY ON A / ONLY ON B / BOTH OPEN / BOTH FREE.
+PORTS may be ranges or a preset name (web, db, dev, common).
+""",
+        "ping": """usage: portpeek ping <HOST:PORT> [-c COUNT] [--interval SEC] [--timeout SEC]
+
+TCP ping with live latency, min/avg/max/jitter. Exit 0 if any probe succeeded.
+""",
+        "menu": "usage: portpeek menu\n\nLaunch the interactive ASCII menu.\n",
+        "repo": f"usage: portpeek repo|github\n\nOpen {GITHUB_URL} and print version.\n",
+    }
+    key = {
+        "pid": "who",
+        "ls": "list",
+        "check": "doctor",
+        "github": "repo",
+    }.get(name, name)
+    return helps.get(key, format_help_text())
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers
+# ---------------------------------------------------------------------------
+
+
+def cmd_freeport(args: argparse.Namespace) -> int:
+    spec = args.targets[0] if args.targets else DEFAULT_FREEPORT_RANGE
+    start, end = parse_freeport_spec(spec)
+    block = args.block if args.block and args.block > 0 else 1
+    found = find_free_port_local(start, end, block=block)
+    if not found:
+        # Fall back to connect-scan based finder
+        ports = list(range(start, end + 1))
+        results = scan_hosts(["127.0.0.1"], ports, timeout=min(args.timeout, 0.15), workers=args.workers)
+        found = find_free_block(ports, results, block)
+    if not found:
+        if not args.quiet:
+            print(f"No free {'block of ' + str(block) if block > 1 else 'port'} in {start}-{end}.", file=sys.stderr)
+        return 1
+    if args.json:
+        if not args.quiet:
+            print(json.dumps({"ports": found} if block > 1 else {"port": found[0]}))
+    elif not args.quiet:
+        text = " ".join(map(str, found)) if block > 1 else str(found[0])
+        print(text)
+        if args.copy:
+            if copy_to_clipboard(text):
+                print("copied to clipboard", file=sys.stderr)
+            else:
+                print("clipboard tool not found", file=sys.stderr)
+    return 0
+
+
+def cmd_who(args: argparse.Namespace) -> int:
+    if not args.targets:
+        print("Error: port required — portpeek who <PORT>", file=sys.stderr)
+        return 2
     try:
-        ports = parse_ports(args.ports)
-        if args.block < 0:
-            raise ValueError("--block must be greater than 0")
+        port = parse_ports([args.targets[0]])[0]
+    except (ValueError, IndexError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    rows = who_port(port)
+    if args.kill:
+        if not rows or not rows[0].get("pid"):
+            if not args.quiet:
+                print(f"Nothing listening on port {port}.", file=sys.stderr)
+            return 1
+        pid = int(rows[0]["pid"])
+        yes = args.yes
+        if not yes and sys.stdin.isatty():
+            confirm = input(f"Send {'SIGKILL' if args.force else 'SIGTERM'} to pid {pid}? [y/N]: ").strip().lower()
+            yes = confirm in ("y", "yes")
+        ok, msg = kill_pid(pid, force=args.force, yes=yes)
+        if not args.quiet:
+            print(msg if ok else f"Error: {msg}", file=sys.stderr if not ok else sys.stdout)
+        return 0 if ok else 1
+
+    if args.json:
+        if not args.quiet:
+            print(json.dumps(rows, indent=2, default=str))
+    elif not args.quiet:
+        print(format_who(rows, no_color=args.no_color))
+    _maybe_export(args, rows)
+    return 0 if rows else 1
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    rows = list_listening(
+        dev_only=args.dev_only,
+        public_only=args.public,
+        search=args.search,
+    )
+    if args.json:
+        if not args.quiet:
+            print(json.dumps(rows, indent=2, default=str))
+    elif not args.quiet:
+        print(format_list_table(rows, no_color=args.no_color))
+        # Extra safety callout
+        risky = [r for r in rows if r.get("public_warning")]
+        if risky and not args.json:
+            print(f"\n⚠ {len(risky)} sensitive port(s) bound publicly — review bind addresses.")
+    _maybe_export(args, rows)
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    try:
+        if len(args.targets) >= 2 and str(args.targets[1]).isdigit():
+            host, port = args.targets[0], int(args.targets[1])
+        elif args.targets:
+            host, port = parse_endpoint(args.targets[0])
+        else:
+            raise ValueError("Need HOST:PORT")
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(2)
+        return 2
+
+    report = diagnose(host, port, force_tls=args.tls, timeout=max(args.timeout, 1.0))
+    if args.json:
+        if not args.quiet:
+            print(json.dumps(report, indent=2, default=str))
+    elif not args.quiet:
+        print(format_doctor(report, no_color=args.no_color))
+    _maybe_export(args, [report])
+    tcp_ok = report.get("tcp", {}).get("success", 0) > 0
+    return 0 if tcp_ok else 1
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    if len(args.targets) < 2:
+        print("Error: portpeek diff <HOST_A> <HOST_B> [PORTS|PRESET]", file=sys.stderr)
+        return 2
+    host_a, host_b = args.targets[0], args.targets[1]
+    rest = args.targets[2:]
+    ports: list[int] = []
+    if not rest:
+        ports = PRESETS["common"]
+    elif len(rest) == 1 and rest[0].lower() in PRESETS:
+        ports = PRESETS[rest[0].lower()]
+    else:
+        try:
+            ports = parse_ports(rest)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+    rows = diff_hosts(host_a, host_b, ports, timeout=args.timeout, workers=args.workers)
+    if args.json:
+        if not args.quiet:
+            print(json.dumps(rows, indent=2))
+    elif not args.quiet:
+        print(format_diff(rows, no_color=args.no_color))
+    _maybe_export(args, rows)
+    # Exit 1 if there are differences in openness
+    differs = any(r["diff"] in ("ONLY ON A", "ONLY ON B") for r in rows)
+    return 1 if differs else 0
+
+
+def cmd_ping(args: argparse.Namespace) -> int:
+    if not args.targets:
+        print("Error: portpeek ping <HOST:PORT>", file=sys.stderr)
+        return 2
+    try:
+        if len(args.targets) >= 2 and args.targets[1].isdigit():
+            host, port = args.targets[0], int(args.targets[1])
+        else:
+            host, port = parse_endpoint(args.targets[0])
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    return tcp_ping(
+        host,
+        port,
+        count=args.count,
+        interval=args.interval,
+        timeout=max(args.timeout, 1.0),
+    )
+
+
+def cmd_repo(args: argparse.Namespace) -> int:
+    print(f"portpeek v{__version__}")
+    print(GITHUB_URL)
+    print(AUTHOR_LINE_HELP)
+    if not args.quiet:
+        webbrowser.open(GITHUB_URL)
+    return 0
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    try:
+        hosts, ports = resolve_hosts_and_ports(
+            args.targets,
+            host_args=args.host,
+            host_file=args.host_file,
+            cidr=args.cidr,
+            preset=args.preset,
+        )
+        if args.block < 0:
+            raise ValueError("--block must be >= 0")
+        if not ports:
+            raise ValueError("No ports specified. Pass ports, ranges, or --preset.")
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     if args.watch is not None:
         watch_loop(
-            hosts=args.host,
+            hosts=hosts,
             ports=ports,
             interval=args.watch,
             timeout=args.timeout,
@@ -462,57 +553,168 @@ def main() -> None:
             measure_latency=args.latency,
             no_color=args.no_color,
         )
-        sys.exit(0)
+        return 0
 
     results = scan_hosts(
-        hosts=args.host,
+        hosts=hosts,
         ports=ports,
         timeout=args.timeout,
         workers=args.workers,
-        measure_latency=args.latency,
+        measure_latency=args.latency or args.max_latency is not None,
         grab_banner=args.banner,
     )
 
+    if args.proc:
+        results = enrich_scan_with_proc(results)
+
     if args.block > 0:
-        for h in args.host:
+        for h in hosts:
             host_res = [r for r in results if r["host"] == h]
             block = find_free_block(ports, host_res, args.block)
             if block:
                 if not args.quiet:
-                    print(json.dumps({"host": h, "ports": block}) if args.json else " ".join(map(str, block)))
-                sys.exit(0)
+                    payload = {"host": h, "ports": block}
+                    print(json.dumps(payload) if args.json else " ".join(map(str, block)))
+                    if args.copy:
+                        copy_to_clipboard(" ".join(map(str, block)))
+                return 0
         if not args.quiet:
             print(f"No contiguous block of {args.block} free ports found.", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     if args.find_free:
         for item in results:
             if item["status"] == "free":
                 if not args.quiet:
                     print(json.dumps(item, indent=2) if args.json else item["port"])
-                sys.exit(0)
+                    if args.copy:
+                        copy_to_clipboard(str(item["port"]))
+                return 0
         if not args.quiet:
             print("No free port found in selection.", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     filtered = results
     if args.only_open:
         filtered = [r for r in results if r["status"] == "open"]
     elif args.only_free:
         filtered = [r for r in results if r["status"] == "free"]
+    if args.max_latency is not None:
+        filtered = [
+            r for r in filtered if r.get("latency_ms", 0) <= args.max_latency or r["status"] == "free"
+        ]
 
-    if args.output:
-        export_results(args.output, filtered)
+    _maybe_export(args, filtered, meta={"hosts": hosts, "ports_count": len(ports)})
 
     any_open = any(r["status"] == "open" for r in results)
 
     if not args.quiet:
         if args.json:
-            print(json.dumps(filtered, indent=2))
+            print(json.dumps(filtered, indent=2, default=str))
         else:
-            print_results(filtered, show_services=args.services, no_color=args.no_color)
+            print_results(
+                filtered,
+                show_services=args.services,
+                no_color=args.no_color,
+                show_proc=args.proc,
+            )
+            if args.summary:
+                print_summary(results, no_color=args.no_color)
 
-    sys.exit(1 if any_open else 0)
+    return 1 if any_open else 0
+
+
+def _maybe_export(
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+    meta: dict[str, Any] | None = None,
+) -> None:
+    if args.output is None:
+        return
+    path = normalize_output_path(args.output)
+    if not path:
+        return
+    written = export_results(path, rows, include_meta=args.include_meta, meta=meta)
+    if not args.quiet and not args.json:
+        print(f"Wrote {written}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def _split_argv(argv: Sequence[str]) -> tuple[str | None, list[str]]:
+    """Detect leading subcommand; return (command|None, remaining argv for parser)."""
+    if not argv:
+        return None, []
+    # help aliases
+    if argv[0] in ("-h", "--help", "help"):
+        return "help", list(argv[1:])
+    if argv[0] in SUBCOMMANDS:
+        return argv[0], list(argv[1:])
+    return None, list(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    command, rest = _split_argv(raw)
+
+    if command == "help":
+        topic = rest[0] if rest else None
+        print(_subcommand_help(topic) if topic else format_help_text())
+        sys.exit(0)
+
+    if command == "menu":
+        # Allow `portpeek menu --help`
+        if rest and rest[0] in ("-h", "--help"):
+            print(_subcommand_help("menu"))
+            sys.exit(0)
+        run_menu()
+        sys.exit(0)
+
+    # Subcommand-specific help before argparse consumes -h
+    if command and rest and rest[0] in ("-h", "--help"):
+        print(_subcommand_help(command))
+        sys.exit(0)
+
+    parser = build_parser()
+    args = parser.parse_args(rest if command else raw)
+
+    dispatch = {
+        "freeport": cmd_freeport,
+        "who": cmd_who,
+        "pid": cmd_who,
+        "list": cmd_list,
+        "ls": cmd_list,
+        "doctor": cmd_doctor,
+        "check": cmd_doctor,
+        "diff": cmd_diff,
+        "ping": cmd_ping,
+        "repo": cmd_repo,
+        "github": cmd_repo,
+    }
+
+    try:
+        if command is None:
+            if not args.targets and not args.preset and not args.host_file and not args.cidr:
+                print(format_help_text(color=False if args.no_color else None))
+                sys.exit(0)
+            code = cmd_scan(args)
+        else:
+            handler = dispatch.get(command)
+            if handler is None:
+                print(f"Unknown command: {command}", file=sys.stderr)
+                sys.exit(2)
+            code = handler(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    sys.exit(code)
 
 
 if __name__ == "__main__":
