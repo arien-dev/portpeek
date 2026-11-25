@@ -120,4 +120,4 @@ portpeek doctor --help
 
 ## License
 
-MIT — **arien-dev** · [github.com/arien-dev/portpeek](https://github.com/arien-dev/portpeek)
+GPL 2.0 — **arien-dev** · [github.com/arien-dev/portpeek](https://github.com/arien-dev/portpeek)
